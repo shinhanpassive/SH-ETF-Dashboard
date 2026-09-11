@@ -2,6 +2,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import imaplib
+import email
+from email.header import decode_header
+import zipfile
+import io
+import datetime
 
 # ----------------------------------------------------------------------
 # 페이지 기본 설정
@@ -10,9 +16,85 @@ st.set_page_config(page_title="ETF Market Monitoring (v7.0)", layout="wide")
 st.title("📊 ETF Market Monitoring Dashboard (통합판)")
 
 # ----------------------------------------------------------------------
-# 데이터 로드 및 전처리 (캐싱 처리 및 속도 최적화)
+# 지메일(Gmail) 첨부파일 자동 수신 및 CSV 추출 함수 (최근 3일치만 검색)
 # ----------------------------------------------------------------------
-@st.cache_data
+def fetch_csvs_from_gmail():
+    gmail_user = st.secrets.get("GMAIL_USER")
+    gmail_pass = st.secrets.get("GMAIL_APP_PASSWORD")
+
+    if not gmail_user or not gmail_pass:
+        st.warning("⚠️ Gmail 연동 정보(secrets.toml)가 설정되지 않아 구글 드라이브 기본 데이터만 로드합니다.")
+        return pd.DataFrame()
+
+    fetched_dfs = []
+
+    try:
+        # 지메일 IMAP 연결
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail.login(gmail_user, gmail_pass)
+        mail.select("inbox")
+
+        # 💡 [핵심 개선] 오늘 기준으로 최근 3일 전 날짜 계산 (속도 최적화)
+        # 예: 오늘이 9월 11일이면 9월 8일 이후 메일만 검색
+        since_date = (datetime.datetime.now() - datetime.timedelta(days=3)).strftime("%d-%b-%Y")
+        
+        # 메일 제목 조건과 날짜 조건을 결합
+        search_query = f'(SUBJECT "[KRX]" SINCE "{since_date}")'
+        status, messages = mail.search(None, search_query)
+
+        if status != "OK" or not messages[0]:
+            mail.logout()
+            return pd.DataFrame()
+
+        email_ids = messages[0].split()
+
+        # 검색된 메일들만 압축 해제 및 읽기
+        for e_id in email_ids:
+            res, msg_data = mail.fetch(e_id, "(RFC822)")
+            for response_part in msg_data:
+                if isinstance(response_part, tuple):
+                    msg = email.message_from_bytes(response_part[1])
+                    
+                    subject, encoding = decode_header(msg["Subject"])[0]
+                    if isinstance(subject, bytes):
+                        subject = subject.decode(encoding if encoding else "utf-8", errors="replace")
+
+                    if "[KRX]" in subject and "구독형 데이터" in subject:
+                        for part in msg.walk():
+                            if part.get_content_maintype() == 'multipart' or part.get('Content-Disposition') is None:
+                                continue
+
+                            filename = part.get_filename()
+                            if filename:
+                                fn_decoded, fn_enc = decode_header(filename)[0]
+                                if isinstance(fn_decoded, bytes):
+                                    filename = fn_decoded.decode(fn_enc if fn_enc else "utf-8", errors="replace")
+
+                                # 알집(.zip) 첨부파일 수신 및 메모리 상에서 바로 풀기
+                                if filename.endswith(".zip") and "[ETF]" in filename:
+                                    zip_bytes = part.get_payload(decode=True)
+                                    
+                                    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+                                        for csv_name in z.namelist():
+                                            if csv_name.endswith(".csv"):
+                                                with z.open(csv_name) as csv_file:
+                                                    df_temp = pd.read_csv(csv_file, encoding='cp949', thousands=',')
+                                                    fetched_dfs.append(df_temp)
+
+        mail.logout()
+
+    except Exception as e:
+        st.error(f"지메일 수신 중 오류가 발생했습니다: {e}")
+
+    if fetched_dfs:
+        return pd.concat(fetched_dfs, ignore_index=True)
+    return pd.DataFrame()
+
+
+# ----------------------------------------------------------------------
+# 데이터 로드 및 전처리 (지메일 통합 로직)
+# ----------------------------------------------------------------------
+@st.cache_data(ttl=3600)  # 1시간이 지나면 캐시를 버리고 백그라운드에서 함수 자동 재실행
 def load_data():
     csv_file_id = "14q4_DyFiyNqm9HrIwvCTnRNIfzM2Y1BY"
     excel_file_id = "1gHKN8CcXch1s3L-O8XOac98uh2c8Lq4N"
@@ -24,7 +106,7 @@ def load_data():
     try:
         df_excel = pd.read_excel(excel_url)
     except Exception as e:
-        st.error(f"구글 드라이브에서 엑셀 마스터 파일을 불러오는 중 오류가 발생했습니다: {e}")
+        st.error(f"구글 드라이브 엑셀 오류: {e}")
         return pd.DataFrame(), {}
 
     master_db = {}
@@ -60,27 +142,38 @@ def load_data():
             'is_rep': is_rep, 'deriv': deriv, 'tracking': tracking, 'category_key': cat_key, 'amc': amc
         }
 
-    # 2. CSV 실적 파일 로드 
+    # 2. 기존 마스터 CSV 파일 로드
     try:
-        df = pd.read_csv(csv_url, encoding='cp949', thousands=',')
+        df_base = pd.read_csv(csv_url, encoding='cp949', thousands=',')
     except Exception as e:
-        st.error(f"구글 드라이브에서 CSV 실적 파일을 불러오는 중 오류가 발생했습니다: {e}")
+        st.error(f"구글 드라이브 CSV 오류: {e}")
         return pd.DataFrame(), {}
 
-    df = df[df['상품그룹ID'].str.upper() == 'ETF'].copy()
+    # 3. 지메일에서 최신 첨부파일(CSV) 데이터 수신 (최근 3일 치)
+    df_gmail = fetch_csvs_from_gmail()
 
-    # 일자 파싱 및 거래대금/수량 산출
+    # 4. 기본 데이터와 이메일 데이터 통합 (위아래로 이어붙이기)
+    if not df_gmail.empty:
+        df = pd.concat([df_base, df_gmail], ignore_index=True)
+    else:
+        df = df_base
+
+    df = df[df['상품그룹ID'].str.upper() == 'ETF'].copy()
     df['거래일자'] = pd.to_datetime(df['거래일자'].astype(str), format='%Y%m%d')
+
+    # 5. 혹시 모를 중복 방지 (같은 날짜, 같은 종목, 같은 회사의 데이터가 겹치면 삭제)
+    df = df.drop_duplicates(subset=['거래일자', '종목코드', '회원사명'], keep='last').copy()
+
+    # 거래대금/수량 전처리
     df['LP매도거래대금'] = df['LP매도거래대금'].fillna(0)
     df['LP매수거래대금'] = df['LP매수거래대금'].fillna(0)
-    
     if 'LP매도거래량' in df.columns: df['LP매도거래량'] = df['LP매도거래량'].fillna(0)
     if 'LP매수거래량' in df.columns: df['LP매수거래량'] = df['LP매수거래량'].fillna(0)
 
     df['총LP거래대금'] = df['LP매도거래대금'] + df['LP매수거래대금']
     df['LP순매수대금'] = df['LP매수거래대금'] - df['LP매도거래대금']
 
-    # 3. 마스터 DB 고속 맵핑
+    # 6. 마스터 DB 고속 맵핑
     master_df = pd.DataFrame.from_dict(master_db, orient='index')
 
     df['종목코드'] = df['종목코드'].str.strip().str.upper().str.replace(' ', '')
@@ -98,6 +191,7 @@ def load_data():
 df, master_db = load_data()
 if df.empty:
     st.stop()
+
 
 # ----------------------------------------------------------------------
 # 사이드바 (Global Date Filter)
@@ -121,7 +215,7 @@ else:
 df_filtered = df[(df['거래일자'].dt.date >= start_date) & (df['거래일자'].dt.date <= end_date)].copy()
 
 # ----------------------------------------------------------------------
-# UI Tabs 구성 (통합 및 재정렬)
+# UI Tabs 구성
 # ----------------------------------------------------------------------
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "1. 종합 대시보드", "2. ETF 구분별 분석", "3. LP사 다각도 분석", 
@@ -135,7 +229,6 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 with tab1:
     st.subheader("📊 시장 핵심 지표 및 추이 (KPI)")
 
-    # 1. 공통 필터 (드롭다운 5개)
     c1, c2, c3, c4, c5 = st.columns(5)
     mkt_filter_t1 = c1.selectbox("국내/해외", ["전체"] + list(df_filtered['market'].unique()), key='t1_mkt')
     ast_filter_t1 = c2.selectbox("주식/그외", ["전체"] + list(df_filtered['asset'].unique()), key='t1_ast')
@@ -143,7 +236,6 @@ with tab1:
     drv_filter_t1 = c4.selectbox("일반/파생", ["전체"] + list(df_filtered['deriv'].unique()), key='t1_drv')
     trk_filter_t1 = c5.selectbox("패시브/액티브", ["전체"] + list(df_filtered['tracking'].unique()), key='t1_trk')
 
-    # 필터 적용
     df_t1 = df_filtered.copy()
     if mkt_filter_t1 != "전체": df_t1 = df_t1[df_t1['market'] == mkt_filter_t1]
     if ast_filter_t1 != "전체": df_t1 = df_t1[df_t1['asset'] == ast_filter_t1]
@@ -151,7 +243,6 @@ with tab1:
     if drv_filter_t1 != "전체": df_t1 = df_t1[df_t1['deriv'] == drv_filter_t1]
     if trk_filter_t1 != "전체": df_t1 = df_t1[df_t1['tracking'] == trk_filter_t1]
 
-    # KPI 지표 계산
     total_amt = df_t1['총LP거래대금'].sum() / 100_000_000
     unique_days = df_t1['거래일자'].nunique()
     daily_avg = total_amt / unique_days if unique_days > 0 else 0
@@ -165,7 +256,6 @@ with tab1:
     col4.metric("활동 LP 회원사 수", f"{active_lp_cnt:,} 사")
     st.divider()
 
-    # LP사별 총 거래대금 바 차트
     lp_total = df_t1.groupby('회원사명')['총LP거래대금'].sum().sort_values(ascending=False) / 100_000_000
     lp_total = lp_total[lp_total > 0]
 
@@ -182,7 +272,6 @@ with tab1:
 
     st.divider()
 
-    # 시계열 거래대금 추이 차트
     st.subheader("📉 시계열(Time-Series) 일별 거래대금 추이")
 
     trend_type = st.radio("추이 분석 관점 선택", ["시장 전체 (Total Market)", "특정 LP사 (Specific LP)", "특정 운용사 (Specific AMC)"], horizontal=True, key='t1_trend')
@@ -210,12 +299,11 @@ with tab1:
             st.plotly_chart(fig_t, use_container_width=True)
 
 # ==========================================
-# Tab 2: ETF 구분별 분석 (점유율 + 매수/매도 현황 병합)
+# Tab 2: ETF 구분별 분석
 # ==========================================
 with tab2:
     st.subheader("📈 ETF 섹터 필터링을 통한 점유율 및 성향 분석")
 
-    # 1. 공통 필터 (드롭다운 5개)
     c1, c2, c3, c4, c5 = st.columns(5)
     mkt_filter_t2 = c1.selectbox("국내/해외", ["전체"] + list(df_filtered['market'].unique()), key='t2_mkt')
     ast_filter_t2 = c2.selectbox("주식/그외", ["전체"] + list(df_filtered['asset'].unique()), key='t2_ast')
@@ -223,7 +311,6 @@ with tab2:
     drv_filter_t2 = c4.selectbox("일반/파생", ["전체"] + list(df_filtered['deriv'].unique()), key='t2_drv')
     trk_filter_t2 = c5.selectbox("패시브/액티브", ["전체"] + list(df_filtered['tracking'].unique()), key='t2_trk')
 
-    # 필터 적용
     df_t2 = df_filtered.copy()
     if mkt_filter_t2 != "전체": df_t2 = df_t2[df_t2['market'] == mkt_filter_t2]
     if ast_filter_t2 != "전체": df_t2 = df_t2[df_t2['asset'] == ast_filter_t2]
@@ -231,14 +318,12 @@ with tab2:
     if drv_filter_t2 != "전체": df_t2 = df_t2[df_t2['deriv'] == drv_filter_t2]
     if trk_filter_t2 != "전체": df_t2 = df_t2[df_t2['tracking'] == trk_filter_t2]
 
-    # 2. 종목별 집계 (추정매매손익 사전 계산용)
     t2_etf = df_t2.groupby(['회원사명', '종목명'])[['총LP거래대금', 'LP매도거래대금', 'LP매수거래대금', 'LP순매수대금', 'LP매도거래량', 'LP매수거래량']].sum().reset_index()
     t2_etf['평균매도단가'] = np.where(t2_etf['LP매도거래량'] > 0, t2_etf['LP매도거래대금'] / t2_etf['LP매도거래량'], 0)
     t2_etf['평균매수단가'] = np.where(t2_etf['LP매수거래량'] > 0, t2_etf['LP매수거래대금'] / t2_etf['LP매수거래량'], 0)
     t2_etf['체결수량(min)'] = t2_etf[['LP매도거래량', 'LP매수거래량']].min(axis=1)
     t2_etf['추정매매이익'] = (t2_etf['평균매도단가'] - t2_etf['평균매수단가']) * t2_etf['체결수량(min)']
 
-    # 3. 회원사 단위 재집계 (점유율 및 성향 분석용 통합 데이터)
     agg_df = t2_etf.groupby('회원사명')[['총LP거래대금', 'LP매도거래대금', 'LP매수거래대금', 'LP순매수대금', '추정매매이익']].sum().reset_index()
     agg_df = agg_df[agg_df['총LP거래대금'] > 0].sort_values('총LP거래대금', ascending=False)
     
@@ -247,7 +332,6 @@ with tab2:
     agg_df['거래대금(억)'] = agg_df['총LP거래대금'] / 100_000_000
     agg_df['추정매매손익(백만)'] = agg_df['추정매매이익'] / 1_000_000
 
-    # --- (1) 시장 점유율 테이블 & 차트 ---
     st.write("### 1️⃣ 타겟 섹터 회원사 점유율")
     col1, col2 = st.columns([1, 1])
     with col1:
@@ -264,7 +348,6 @@ with tab2:
 
     st.divider()
 
-    # --- (2) 매수/매도 성향 차트 & 테이블 ---
     st.write("### 2️⃣ LP사 매수/매도 스탠스 (순매수 현황)")
     imb_df = agg_df.copy()
     imb_df['순매수비율(%)'] = np.where(imb_df['총LP거래대금'] > 0, (imb_df['LP순매수대금'] / imb_df['총LP거래대금']) * 100, 0)
@@ -374,7 +457,6 @@ with tab3:
 
         st.divider()
 
-        # --- 3️⃣ 전체 거래 종목 상세 분석 (합계 행 추가 및 누적비중 삭제) ---
         st.subheader(f"3️⃣ [{target_lp}] 전체 거래 종목 상세 분석 (섹터 필터링 & 추정매매손익)")
         
         fd1, fd2, fd3, fd4, fd5 = st.columns(5)
@@ -413,7 +495,6 @@ with tab3:
             detail_etfs['추정매매손익(백만)'] = detail_etfs['추정매매이익'] / 1_000_000
             detail_etfs['비중(%)'] = (detail_etfs['총LP거래대금'] / total_detail_vol) * 100
 
-            # 합계 데이터 프레임 생성 (순위를 0으로 지정하여 상단 배치)
             total_row = pd.DataFrame([{
                 '순위': 0,
                 '종목명': '📊 [총 합계]',
@@ -425,12 +506,10 @@ with tab3:
                 '비중(%)': 100.0
             }])
 
-            # 기존 데이터프레임과 합계 행 합치기
             detail_etfs = pd.concat([total_row, detail_etfs], ignore_index=True)
 
             st.write(f"해당 필터 조건 거래 종목 수: **{len(detail_etfs)-1:,}개** | 기간 총 거래대금: **{total_detail_vol/100_000_000:,.0f}억원**")
 
-            # 누적비중 열 삭제됨
             show_cols = ['순위', '종목명', '거래대금(억)', '매도대금(억)', '매수대금(억)', '순매수대금(억)', '추정매매손익(백만)', '비중(%)']
             
             st.dataframe(
